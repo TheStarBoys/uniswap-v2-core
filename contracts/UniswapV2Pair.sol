@@ -27,6 +27,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     uint public price1CumulativeLast;
     uint public kLast; // reserve0 * reserve1, as of immediately after the most recent liquidity event
 
+    // [STAR COMMENT]: reserve0 * reserve1 == balance0 * balance1 == K
     uint private unlocked = 1;
     modifier lock() {
         require(unlocked == 1, 'UniswapV2: LOCKED');
@@ -76,6 +77,8 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
         uint32 timeElapsed = blockTimestamp - blockTimestampLast; // overflow is desired
         if (timeElapsed > 0 && _reserve0 != 0 && _reserve1 != 0) {
             // * never overflows, and + overflow is desired
+            // [STAR COMMENT]: 2^224 * 2^32 = 2^256, so never overflow
+            // records spot price weighted by time elapsed
             price0CumulativeLast += uint(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;
             price1CumulativeLast += uint(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;
         }
@@ -86,6 +89,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     }
 
     // if fee is on, mint liquidity equivalent to 1/6th of the growth in sqrt(k)
+    // [STAR COMMENT]: about 1/6th. i.e. approximately equal to totalSupply * rootK/rootKLast / 6
     function _mintFee(uint112 _reserve0, uint112 _reserve1) private returns (bool feeOn) {
         address feeTo = IUniswapV2Factory(factory).feeTo();
         feeOn = feeTo != address(0);
@@ -120,6 +124,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
             liquidity = Math.sqrt(amount0.mul(amount1)).sub(MINIMUM_LIQUIDITY);
            _mint(address(0), MINIMUM_LIQUIDITY); // permanently lock the first MINIMUM_LIQUIDITY tokens
         } else {
+            // [STAR COMMENT]: 按对应代币占比较小的值，产生流动性。因为提供流动性时可能不是按照现货价格1:1提供的。
             liquidity = Math.min(amount0.mul(_totalSupply) / _reserve0, amount1.mul(_totalSupply) / _reserve1);
         }
         require(liquidity > 0, 'UniswapV2: INSUFFICIENT_LIQUIDITY_MINTED');
@@ -161,6 +166,8 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
         (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
         require(amount0Out < _reserve0 && amount1Out < _reserve1, 'UniswapV2: INSUFFICIENT_LIQUIDITY');
 
+        // [STAR COMMENT]: 注意，此时 balance0 和 balance1 与 reserve0 和 reserve1 可能并不对应相等
+        // 因为存在 token 转入的情况
         uint balance0;
         uint balance1;
         { // scope for _token{0,1}, avoids stack too deep errors
@@ -173,12 +180,33 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
         balance0 = IERC20(_token0).balanceOf(address(this));
         balance1 = IERC20(_token1).balanceOf(address(this));
         }
+        
+        // [STAR COMMENT]: 当转入了 token0 时，(balance0 > _reserve0 - amount0Out) 条件是成立的，得到真实转入的数量
         uint amount0In = balance0 > _reserve0 - amount0Out ? balance0 - (_reserve0 - amount0Out) : 0;
         uint amount1In = balance1 > _reserve1 - amount1Out ? balance1 - (_reserve1 - amount1Out) : 0;
         require(amount0In > 0 || amount1In > 0, 'UniswapV2: INSUFFICIENT_INPUT_AMOUNT');
         { // scope for reserve{0,1}Adjusted, avoids stack too deep errors
         uint balance0Adjusted = balance0.mul(1000).sub(amount0In.mul(3));
         uint balance1Adjusted = balance1.mul(1000).sub(amount1In.mul(3));
+        // [STAR COMMENT]: 这个不等式左右同时除以 1000**2 就清晰了
+        // balance0Adjusted => balance0 - amount0In * 3 / 1000
+        // balance1Adjusted => balance1 - amount1In * 3 / 1000
+        // amount0In * 3 / 1000 这里就是一个手续费的设置
+        // 不等式右侧 => reserve0 * reserve1 = K
+
+        // 1. 假设没有手续费，那么不等式变为 balance0 * balance1 >= reserve0 * reserve1
+        // 1.a. 如果此时使用Uniswap提供的辅助库，那么一定有 balance0 * balance1 = reserve0 * reserve1
+        // 1.b. 如果没使用，传入了一个非法数值，极端例子是 amount{0,1}In 都为0，但 amount1Out 不为0，此时就违反了常量乘积公式的定义
+        // 1.c. 那么什么情况下 K 会增大？一个例子是 amount{0,1}In 都不为 0，但只有 amount1Out 不为0
+        // 带入具体数值就是，假设 K 为 12，reserve0 / reserve 1 = 2 / 6，如果 balance0 变为 3，说明
+        // 是从 token0 兑换为 token1，正常逻辑维持 K 不变，balance1 将变为 4。但如果转入时，不仅转入了 token0，
+        // 还转入了 token1，就会到只 balance1 大于 4，从而 K 增大。这种条件是被允许的，意味着无偿的给协议提供了额外的流动性。
+
+        // 2. 假设有手续费，其他情况跟上述一致
+        // 2.a. 假设 amount0In 和 amount1In 不同时为 0，为了方便，假设 amount0In 不为 0，但由于 Uniswap 库
+        // 获取 amount1Out 时包含了0.3%手续费，也就意味着 amount1Out 更小，那么实际使用的 amount0In 就更小。
+        // 因此 balance0 中多出了 0.3% amount0In 的代币没有进行兑换，如果不减去这个数，下面的不等式是肯定能够满足的。
+        // 因此需要减去手续费带来的影响。
         require(balance0Adjusted.mul(balance1Adjusted) >= uint(_reserve0).mul(_reserve1).mul(1000**2), 'UniswapV2: K');
         }
 
